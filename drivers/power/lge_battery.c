@@ -38,6 +38,8 @@
 #define WATCH_DELAY			30000
 #define DEMO_MODE_MAX			35
 #define DEMO_MODE_MIN			30
+#define DEFAULT_CHARGE_STOP_LEVEL	100
+#define DEFAULT_CHARGE_START_LEVEL	0
 
 enum debug_mask_print {
 	ASSERT = BIT(0),
@@ -156,6 +158,8 @@ static struct bm_batt_id_table valid_batt_id[BM_BATT_MAX] = {
 
 static int debug_mask = ERROR | INTERRUPT | MISC | VERBOSE;
 static int demo_mode;
+static int charge_stop_level = DEFAULT_CHARGE_STOP_LEVEL;
+static int charge_start_level = DEFAULT_CHARGE_START_LEVEL;
 
 static int bm_get_property(struct power_supply *psy,
 			   enum power_supply_property prop, int *value)
@@ -195,6 +199,20 @@ static int bm_set_property(struct power_supply *psy,
 		pr_bm(ERROR, "Couldn't set property %d, rc=%d\n", prop, rc);
 
 	return rc;
+}
+
+static int battery_power_supply_changed(void)
+{
+	struct power_supply *batt_psy;
+
+	batt_psy = power_supply_get_by_name("battery");
+	if (!batt_psy) {
+		pr_bm(ERROR, "Couldn't get batt_psy\n");
+		return -ENODEV;
+	}
+
+	power_supply_changed(batt_psy);
+	return 0;
 }
 
 static int bm_vote_fcc_update(struct battery_manager *bm)
@@ -274,13 +292,13 @@ void bm_check_demo_mode(struct battery_manager *bm)
 		bm->demo_iusb = 1;
 		bm->demo_ibat = 1;
 	} else {
-		if (bm->batt_soc > DEMO_MODE_MAX) {
+		if (bm->batt_soc > charge_stop_level) {
 			bm->demo_iusb = 0;
 			bm->demo_ibat = 0;
-		} else if (bm->batt_soc >= DEMO_MODE_MAX) {
+		} else if (bm->batt_soc >= charge_stop_level) {
 			bm->demo_iusb = 1;
 			bm->demo_ibat = 0;
-		} else if (bm->batt_soc < DEMO_MODE_MIN) {
+		} else if (bm->batt_soc <= charge_start_level) {
 			bm->demo_iusb = 1;
 			bm->demo_ibat = 1;
 		}
@@ -448,8 +466,7 @@ static void bm_watch_work(struct work_struct *work)
 		goto error;
 	}
 
-	if (bm->bm_active)
-		bm_check_therm_charging(bm, batt_temp, batt_volt);
+	bm_check_therm_charging(bm, batt_temp, batt_volt);
 
 	rc = bm_get_property(bm->batt_psy,
 			     POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
@@ -628,6 +645,21 @@ static int bm_fb_register_notifier(struct battery_manager *bm)
 	return rc;
 }
 
+static bool lge_correct_battery_type(struct power_supply *bms_psy)
+{
+	union power_supply_propval pval;
+	int rc;
+
+	rc = power_supply_get_property(bms_psy,
+				       POWER_SUPPLY_PROP_BATTERY_TYPE, &pval);
+	if (rc < 0) {
+		pr_bm(ERROR, "Couldn't read battery type, rc=%d\n", rc);
+		return false;
+	}
+
+	return strstr(pval.strval, "lge");
+}
+
 static int bm_init(struct battery_manager *bm)
 {
 	int i, rc, batt_temp, batt_volt, batt_id = 0;
@@ -665,11 +697,21 @@ static int bm_init(struct battery_manager *bm)
 	rc = bm_get_property(bm->bms_psy,
 			     POWER_SUPPLY_PROP_RESISTANCE_ID, &batt_id);
 	if (rc < 0) {
+		pr_bm(ERROR, "Unable to read battery-type rc=%d\n", rc);
+		if (!lge_correct_battery_type(bm->bms_psy)) {
+			pr_bm(ERROR, "Battery is not an LGE battery, not registering driver!\n");
+			return -ENODEV;
+		}
 		bm->batt_id = BM_BATT_TOCAD;
 	} else {
 		if (!batt_id) {
 			pr_bm(ERROR, "Battery id is zero, deferring probe!\n");
 			return -EPROBE_DEFER;
+		}
+
+		if (!lge_correct_battery_type(bm->bms_psy)) {
+			pr_bm(ERROR, "Battery is not an LGE battery, not registering driver!\n");
+			return -ENODEV;
 		}
 
 		for (i = 0; i < BM_BATT_MAX; i++) {
@@ -868,7 +910,6 @@ static void __exit lge_battery_exit(void)
 
 static int set_demo_mode(const char *val, const struct kernel_param *kp)
 {
-	struct power_supply *batt_psy;
 	int rc = 0;
 	int old_val = demo_mode;
 
@@ -881,13 +922,15 @@ static int set_demo_mode(const char *val, const struct kernel_param *kp)
 	if (demo_mode == old_val)
 		return 0;
 
-	batt_psy = power_supply_get_by_name("battery");
-	if (!batt_psy) {
-		pr_bm(ERROR, "Couldn't get batt_psy\n");
-		return -ENODEV;
+	if (demo_mode) {
+		charge_stop_level = DEMO_MODE_MAX;
+		charge_start_level = DEMO_MODE_MIN;
+	} else {
+		charge_stop_level = DEFAULT_CHARGE_STOP_LEVEL;
+		charge_start_level = DEFAULT_CHARGE_START_LEVEL;
 	}
+	battery_power_supply_changed();
 
-	power_supply_changed(batt_psy);
 	return 0;
 }
 
@@ -898,6 +941,82 @@ static struct kernel_param_ops demo_mode_ops = {
 
 module_param_cb(demo_mode, &demo_mode_ops, &demo_mode, 0644);
 MODULE_PARM_DESC(demo_mode, "VZW Demo mode <on|off>");
+
+static int set_charge_stop_level(const char *val,
+				 const struct kernel_param *kp)
+{
+	int rc;
+	int old_val = charge_stop_level;
+
+	rc = param_set_int(val, kp);
+	if (rc) {
+		pr_bm(ERROR, "Unable to set charge_stop_level: %d\n", rc);
+		return rc;
+	}
+
+	if (charge_stop_level == old_val)
+		return 0;
+
+	if (charge_stop_level <= charge_start_level) {
+		charge_stop_level = old_val;
+		return 0;
+	}
+
+	if ((charge_stop_level == DEFAULT_CHARGE_STOP_LEVEL) &&
+	    (charge_start_level == DEFAULT_CHARGE_START_LEVEL))
+		demo_mode = 0;
+	else
+		demo_mode = 1;
+
+	battery_power_supply_changed();
+
+	return 0;
+}
+
+static struct kernel_param_ops charge_stop_ops = {
+	.set = set_charge_stop_level,
+	.get = param_get_int,
+};
+module_param_cb(charge_stop_level, &charge_stop_ops,
+		&charge_stop_level, 0644);
+
+static int set_charge_start_level(const char *val,
+				  const struct kernel_param *kp)
+{
+	int rc;
+	int old_val = charge_start_level;
+
+	rc = param_set_int(val, kp);
+	if (rc) {
+		pr_bm(ERROR, "Unable to set charge_start_level: %d\n", rc);
+		return rc;
+	}
+
+	if (charge_start_level == old_val)
+		return 0;
+
+	if (charge_stop_level <= charge_start_level) {
+		charge_start_level = old_val;
+		return 0;
+	}
+
+	if ((charge_stop_level == DEFAULT_CHARGE_STOP_LEVEL) &&
+	    (charge_start_level == DEFAULT_CHARGE_START_LEVEL))
+		demo_mode = 0;
+	else
+		demo_mode = 1;
+
+	battery_power_supply_changed();
+
+	return 0;
+}
+
+static struct kernel_param_ops charge_start_ops = {
+	.set = set_charge_start_level,
+	.get = param_get_int,
+};
+module_param_cb(charge_start_level, &charge_start_ops,
+		&charge_start_level, 0644);
 
 module_init(lge_battery_init);
 module_exit(lge_battery_exit);
